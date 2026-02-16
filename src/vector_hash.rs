@@ -17,9 +17,9 @@ pub struct VectorHash<K: Hash + Eq, V> {
 }
 
 
-const EMPTY: u8 = 0;
-const FULL: u8 = 1;
-const TOMBSTONE: u8 = 2;
+const EMPTY: u8 = 0x80;
+const FULL: u8 = 0x00;
+const TOMBSTONE: u8 = 0xFE;
 
 impl<K: Hash + Eq, V> VectorHash<K, V> {
     pub fn new() -> Self {
@@ -55,7 +55,7 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
             size,
             keys,
             values,
-            ctrl: vec![EMPTY; size], // 0 => unoccupied, 1 => occupied, 2 => tombstone
+            ctrl: vec![EMPTY; size],
 
             elements: 0,
             tombstones: 0,
@@ -65,21 +65,33 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
 
     #[inline(never)] // for flamegraph
     pub fn get(&self, key: &K) -> Option<&V> {
-        let mut i = self.index(key);
+        let (mut i, hash) = self.index(key);
+        let fingerprint = (hash & 0x7F) as u8;
 
+        let mut candidates: Vec<usize> = Vec::with_capacity(10);
         loop {
             // never an infinite loop, as there are always empty slots in array
             match self.ctrl[i] {
-                EMPTY => return None,
-                FULL if unsafe { self.keys[i].assume_init_ref() } == key => return Some(unsafe { self.values[i].assume_init_ref() }),
-                _ => i = (i + 1) & self.size - 1,
+                EMPTY => break,
+                TOMBSTONE => {},
+                _ if self.ctrl[i] & 0x7F == fingerprint => candidates.push(i),
+                _ => {},
+            };
+            i = (i + 1) & self.size - 1
+        }
+
+        for i in candidates {
+            if key == unsafe { self.keys[i].assume_init_ref() } {
+                return Some(unsafe { self.values[i].assume_init_ref() })
             }
         }
+
+        None
     }
 
     #[inline(never)] // for flamegraph
     pub fn put(&mut self, key: K, value: V) -> Option<V> {
-        let mut i = self.index(&key);
+        let (mut i, hash) = self.index(&key);
         let mut first_deleted: Option<usize> = None;
 
         loop {
@@ -90,7 +102,7 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
                         self.tombstones -= 1;
                     }
 
-                    self.ctrl[i] = FULL;
+                    self.ctrl[i] = (hash & 0x7F) as u8;
                     self.keys[i].write(key);
                     self.values[i].write(value);
                     self.elements += 1;
@@ -99,31 +111,31 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
                     }
                     return None;
                 }
-                FULL if unsafe { self.keys[i].assume_init_ref() } == &key => { // occupied with same key
-                    let old = unsafe { ptr::read(self.values[i].as_ptr()) };
-                    self.values[i].write(value);
-                    return Some(old);
-                }
                 TOMBSTONE => { // can place at first tombstone we encounter
                     if first_deleted.is_none() {
                         first_deleted = Some(i);
                     }
-                    i = (i + 1) & self.size - 1;
                 }
-                _ => i = (i + 1) & self.size - 1,
+                _ if self.ctrl[i] & 0x80 == FULL && unsafe { self.keys[i].assume_init_ref() } == &key => { // occupied with same key TODO: use same as get logic
+                    let old = unsafe { ptr::read(self.values[i].as_ptr()) };
+                    self.values[i].write(value);
+                    return Some(old);
+                }
+                _ => {},
             }
+            i = (i + 1) & self.size - 1;
         }
     }
 
     #[inline(never)] // for flamegraph
     pub fn delete(&mut self, key: &K) -> Option<V> {
-        let mut i = self.index(key);
+        let (mut i, _) = self.index(key);
 
         loop {
             match self.ctrl[i] {
                 EMPTY => return None,
-                FULL if unsafe { self.keys[i].assume_init_ref() } == key => {
-                    self.ctrl[i] = TOMBSTONE;
+                _ if self.ctrl[i] & 0x80 == FULL && unsafe { self.keys[i].assume_init_ref() } == key => { // TODO: same as get logic
+                    self.ctrl[i] = 0xFF;
                     self.tombstones += 1;
                     self.elements -= 1;
                     if self.tombstones > self.size / 3 {
@@ -147,7 +159,7 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
         let old_ctrl = std::mem::take(&mut self.ctrl);
 
         for i in 0..self.size {
-            if old_ctrl[i] == FULL {
+            if old_ctrl[i] & 0x80 == FULL {
                 unsafe {
                     let k = ptr::read(old_keys[i].as_ptr());
                     let v = ptr::read(old_values[i].as_ptr());
@@ -168,7 +180,7 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
         let old_ctrl = std::mem::take(&mut self.ctrl);
 
         for i in 0..self.size {
-            if old_ctrl[i] == FULL {
+            if old_ctrl[i] & 0x80 == FULL {
                 unsafe {
                     let k = ptr::read(old_keys[i].as_ptr());
                     let v = ptr::read(old_values[i].as_ptr());
@@ -181,11 +193,11 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
     }
 
     #[inline(never)] // for flamegraph
-    fn index(&self, key: &K) -> usize {
+    fn index(&self, key: &K) -> (usize, u64) {
         let mut hasher = AHasher::default();
         key.hash(&mut hasher);
-        let hash = hasher.finish() as usize;
-        hash & (self.size - 1)
+        let hash = hasher.finish();
+        (hash as usize & (self.size - 1), hash)
     }
 }
 
@@ -196,7 +208,7 @@ impl<K: Hash + Eq, V> Drop for VectorHash<K, V> {
         let old_ctrl = std::mem::take(&mut self.ctrl);
 
         for i in 0..old_ctrl.len() {
-            if old_ctrl[i] == FULL {
+            if old_ctrl[i] & 0x80 == FULL {
                 unsafe {
                     ptr::drop_in_place(old_keys[i].as_mut_ptr());
                     ptr::drop_in_place(old_values[i].as_mut_ptr());
