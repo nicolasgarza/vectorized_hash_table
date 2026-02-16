@@ -23,27 +23,27 @@ const TOMBSTONE: u8 = 2;
 
 impl<K: Hash + Eq, V> VectorHash<K, V> {
     pub fn new() -> Self {
-        let mut keys = Vec::with_capacity(100);
-        let mut values = Vec::with_capacity(100);
+        let mut keys = Vec::with_capacity(128);
+        let mut values = Vec::with_capacity(128);
         unsafe {
-            keys.set_len(100);
-            values.set_len(100);
+            keys.set_len(128);
+            values.set_len(128);
         }
 
         VectorHash {
-            size: 100,
+            size: 128,
             keys,
             values,
-            ctrl: vec![EMPTY; 100], // 0 => unoccupied, 1 => occupied, 2 => tombstone
+            ctrl: vec![EMPTY; 128], // 0 => unoccupied, 1 => occupied, 2 => tombstone
 
             elements: 0,
             tombstones: 0,
-            resize_threshold: 50, // size / 2
+            resize_threshold: 64, // size / 2
         }
     }
 
     pub fn with_capacity(size: usize) -> Self {
-        let size = max(size, 100);
+        let size = max(size, 128);
         let mut keys = Vec::with_capacity(size);
         let mut values = Vec::with_capacity(size);
         unsafe {
@@ -63,6 +63,7 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
         }
     }
 
+    #[inline(never)] // for flamegraph
     pub fn get(&self, key: &K) -> Option<&V> {
         let mut i = self.index(key);
 
@@ -71,11 +72,12 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
             match self.ctrl[i] {
                 EMPTY => return None,
                 FULL if unsafe { self.keys[i].assume_init_ref() } == key => return Some(unsafe { self.values[i].assume_init_ref() }),
-                _ => i = (i + 1) % self.size,
+                _ => i = (i + 1) & self.size - 1,
             }
         }
     }
 
+    #[inline(never)] // for flamegraph
     pub fn put(&mut self, key: K, value: V) -> Option<V> {
         let mut i = self.index(&key);
         let mut first_deleted: Option<usize> = None;
@@ -106,13 +108,14 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
                     if first_deleted.is_none() {
                         first_deleted = Some(i);
                     }
-                    i = (i + 1) % self.size;
+                    i = (i + 1) & self.size - 1;
                 }
-                _ => i = (i + 1) % self.size,
+                _ => i = (i + 1) & self.size - 1,
             }
         }
     }
 
+    #[inline(never)] // for flamegraph
     pub fn delete(&mut self, key: &K) -> Option<V> {
         let mut i = self.index(key);
 
@@ -130,13 +133,14 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
                     unsafe { std::ptr::drop_in_place(self.keys[i].as_mut_ptr()) };
                     return Some(unsafe { ptr::read(self.values[i].as_ptr()) });
                 }
-                _ => i = (i + 1) % self.size,
+                _ => i = (i + 1) & self.size - 1,
             }
         }
     }
 
+    #[inline(never)] // for flamegraph
     fn resize(&mut self) {
-        let mut new_map = VectorHash::<K, V>::with_capacity(self.size * 3);
+        let mut new_map = VectorHash::<K, V>::with_capacity(self.size * 4);
 
         let old_keys = std::mem::take(&mut self.keys);
         let old_values = std::mem::take(&mut self.values);
@@ -155,6 +159,7 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
         *self = new_map;
     }
 
+    #[inline(never)] // for flamegraph
     fn clear_tombstones(&mut self) {
         let mut new_map = VectorHash::<K, V>::with_capacity(self.size);
 
@@ -175,11 +180,12 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
         *self = new_map;
     }
 
+    #[inline(never)] // for flamegraph
     fn index(&self, key: &K) -> usize {
         let mut hasher = AHasher::default();
         key.hash(&mut hasher);
-        let hash = hasher.finish();
-        hash as usize % self.size
+        let hash = hasher.finish() as usize;
+        hash & (self.size - 1)
     }
 }
 

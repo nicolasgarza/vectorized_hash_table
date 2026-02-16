@@ -1,14 +1,51 @@
 mod vector_hash;
 
+use std::time::Instant;
 use vector_hash::VectorHash;
 
 fn main() {
-    let mut map = VectorHash::new();
-    map.put(5, 5);
-    println!("{:?}", map.get(&5));
+    let mut map: VectorHash<u64, u64> = VectorHash::new();
+    let mut checksum: u64 = 0;
 
-    map.delete(&5);
-    println!("{:?}", map.get(&5));
+    let n: u64 = 300_000;
+    let start = Instant::now();
+
+    for k in 0..n {
+        map.put(k, k + 1);
+    }
+
+    for k in 0..n {
+        if let Some(v) = map.get(&k) {
+            checksum ^= *v;
+        }
+    }
+
+    for k in 0..n {
+        if let Some(old) = map.put(k, k * 2) {
+            checksum ^= old;
+        }
+    }
+
+    for k in (0..n).step_by(2) {
+        if let Some(old) = map.delete(&k) {
+            checksum ^= old;
+        }
+    }
+
+    for k in (0..n).step_by(2) {
+        map.put(k, k * 3);
+    }
+
+    for k in 0..n {
+        if let Some(v) = map.get(&k) {
+            checksum ^= *v;
+        }
+    }
+
+    let duration = start.elapsed();
+    println!("Test took {} ms", duration.as_millis());
+
+    println!("checksum={checksum}");
 }
 
 #[cfg(test)]
