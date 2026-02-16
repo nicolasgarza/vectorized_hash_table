@@ -1,5 +1,5 @@
 use std::cmp::max;
-use std::collections::hash_map::DefaultHasher;
+use ahash::AHasher;
 use std::hash::{Hash, Hasher};
 use std::mem::MaybeUninit;
 use std::ptr;
@@ -32,8 +32,8 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
 
         VectorHash {
             size: 100,
-            keys: keys,
-            values: values,
+            keys,
+            values,
             ctrl: vec![EMPTY; 100], // 0 => unoccupied, 1 => occupied, 2 => tombstone
 
             elements: 0,
@@ -52,9 +52,9 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
         }
 
         VectorHash{
-            size: size,
-            keys: keys,
-            values: values,
+            size,
+            keys,
+            values,
             ctrl: vec![EMPTY; size], // 0 => unoccupied, 1 => occupied, 2 => tombstone
 
             elements: 0,
@@ -64,7 +64,7 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
     }
 
     pub fn get(&self, key: &K) -> Option<&V> {
-        let mut i = self.index(&key);
+        let mut i = self.index(key);
 
         loop {
             // never an infinite loop, as there are always empty slots in array
@@ -114,7 +114,7 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
     }
 
     pub fn delete(&mut self, key: &K) -> Option<V> {
-        let mut i = self.index(&key);
+        let mut i = self.index(key);
 
         loop {
             match self.ctrl[i] {
@@ -123,6 +123,9 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
                     self.ctrl[i] = TOMBSTONE;
                     self.tombstones += 1;
                     self.elements -= 1;
+                    if self.tombstones > self.size / 3 {
+                        self.clear_tombstones();
+                    }
 
                     unsafe { std::ptr::drop_in_place(self.keys[i].as_mut_ptr()) };
                     return Some(unsafe { ptr::read(self.values[i].as_ptr()) });
@@ -152,8 +155,28 @@ impl<K: Hash + Eq, V> VectorHash<K, V> {
         *self = new_map;
     }
 
+    fn clear_tombstones(&mut self) {
+        let mut new_map = VectorHash::<K, V>::with_capacity(self.size);
+
+        let old_keys = std::mem::take(&mut self.keys);
+        let old_values = std::mem::take(&mut self.values);
+        let old_ctrl = std::mem::take(&mut self.ctrl);
+
+        for i in 0..self.size {
+            if old_ctrl[i] == FULL {
+                unsafe {
+                    let k = ptr::read(old_keys[i].as_ptr());
+                    let v = ptr::read(old_values[i].as_ptr());
+                    new_map.put(k, v);
+                }
+            }
+        }
+
+        *self = new_map;
+    }
+
     fn index(&self, key: &K) -> usize {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = AHasher::default();
         key.hash(&mut hasher);
         let hash = hasher.finish();
         hash as usize % self.size
