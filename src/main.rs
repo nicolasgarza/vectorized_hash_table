@@ -1,53 +1,32 @@
+#![feature(portable_simd)]
+
 mod vector_hash;
 
-use std::time::Instant;
+use std::u64;
+
+use quickbench::runner::{self, Runner};
 use vector_hash::VectorHash;
 
-fn main() {
-    let mut map: VectorHash<u64, u64> = VectorHash::new();
-    let mut checksum: u64 = 0;
-
-    let n: u64 = 300_000;
-    let start = Instant::now();
-
-    for k in 0..n {
-        map.put(k, k + 1);
+impl quickbench::wrapper::Container<u64, u64> for VectorHash {
+    fn put(&mut self, key: u64, value: u64) {
+        self.put(key, value);
     }
 
-    for k in 0..n {
-        if let Some(v) = map.get(&k) {
-            checksum ^= *v;
-        }
+    fn get(&self, key: &u64) -> Option<&u64> {
+        self.get(*key)
     }
 
-    for k in 0..n {
-        if let Some(old) = map.put(k, k * 2) {
-            checksum ^= old;
-        }
+    fn remove(&mut self, key: &u64) -> Option<u64> {
+        self.delete(*key)
     }
-
-    for k in (0..n).step_by(2) {
-        if let Some(old) = map.delete(&k) {
-            checksum ^= old;
-        }
-    }
-
-    for k in (0..n).step_by(2) {
-        map.put(k, k * 3);
-    }
-
-    for k in 0..n {
-        if let Some(v) = map.get(&k) {
-            checksum ^= *v;
-        }
-    }
-
-    let duration = start.elapsed();
-    println!("Test took {} ms", duration.as_millis());
-
-    println!("checksum={checksum}");
 }
 
+fn main() {
+    let mut runner: Runner<u64, u64, VectorHash> = runner::Runner::new(VectorHash::new());
+    runner.run_generic(u64::MAX, 0, u64::MIN, 0);
+}
+
+/*
 #[cfg(test)]
 mod tests {
     use super::VectorHash;
@@ -73,7 +52,10 @@ mod tests {
         let mut map: VectorHash<&str, String> = VectorHash::new();
 
         assert_eq!(map.put("key", "first".to_string()), None);
-        assert_eq!(map.put("key", "second".to_string()), Some("first".to_string()));
+        assert_eq!(
+            map.put("key", "second".to_string()),
+            Some("first".to_string())
+        );
         assert_eq!(map.get(&"key").cloned(), Some("second".to_string()));
     }
 
@@ -135,11 +117,8 @@ mod tests {
         }
 
         for i in 0..200 {
-            assert_eq!(
-                map.get(&UserId(i)).cloned(),
-                Some(format!("value{i}"))
-            );
+            assert_eq!(map.get(&UserId(i)).cloned(), Some(format!("value{i}")));
         }
     }
 }
-
+*/

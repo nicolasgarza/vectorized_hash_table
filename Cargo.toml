@@ -11,3 +11,4 @@ codegen-units = 1
 
 [dependencies]
 ahash = "0.8.12"
+quickbench = {git = "https://github.com/nicolasgarza/quickbench.git"}
