@@ -5,153 +5,129 @@ use std::hash::{Hash, Hasher};
 // use std::simd::cmp::SimdPartialEq;
 
 pub struct VectorHash {
-    size: usize,
-    keys: Vec<u64>,
-    values: Vec<u64>,
-    ctrl: Vec<u8>,
+    num_keys: usize,
+    num_tombstones: usize,
+    buckets: Vec<Bucket>,
+}
 
-    // load factor: 0.5
-    elements: usize,
-    tombstones: usize,
-    resize_threshold: usize,
+pub struct Bucket {
+    fingerprints: [u8; 16],
+    pairs: [(u64, u64); 32],
+}
+
+impl Default for Bucket {
+    fn default() -> Self {
+        let fingerprints = [EMPTY; 16];
+        Self {
+            fingerprints,
+            pairs: Default::default(),
+        }
+    }
 }
 
 const EMPTY: u8 = 0x80;
-const FULL: u8 = 0x00;
 const TOMBSTONE: u8 = 0xFE;
+const BUCKET_SIZE: usize = 16;
+const LOAD_FACTOR: f64 = 0.7;
 
 impl VectorHash {
     pub fn new() -> Self {
         VectorHash {
-            size: 128,
-            keys: vec![0; 128],
-            values: vec![0; 128],
-            ctrl: vec![EMPTY; 128], // 0 => unoccupied, 1 => occupied, 2 => tombstone
-
-            elements: 0,
-            tombstones: 0,
-            resize_threshold: 64, // size / 2
+            num_keys: 0,
+            num_tombstones: 0,
+            buckets: (0..16).map(|_| Bucket::default()).collect(),
         }
     }
 
     pub fn with_capacity(size: usize) -> Self {
-        let size = max(size, 128); // TODO: align size arugment
+        let size = max(size, 16);
 
         VectorHash {
-            size,
-            keys: vec![0; 128],
-            values: vec![0; 128],
-            ctrl: vec![EMPTY; size],
-
-            elements: 0,
-            tombstones: 0,
-            resize_threshold: size / 2,
+            num_keys: 0,
+            num_tombstones: 0,
+            buckets: (0..size).map(|_| Bucket::default()).collect(),
         }
     }
 
     #[inline(never)] // for flamegraph
-    pub fn get(&self, key: u64) -> Option<&u64> {
+    pub fn get(&self, key: u64) -> Option<u64> {
         let (mut i, hash) = self.index(key);
         let fingerprint = (hash & 0x7F) as u8;
 
-        let mut candidates: Vec<usize> = Vec::with_capacity(10);
         loop {
             // never an infinite loop, as there are always empty slots in array
-            match self.ctrl[i] {
-                EMPTY => break,
-                TOMBSTONE => {}
-                _ if self.ctrl[i] & 0x7F == fingerprint => candidates.push(i),
-                _ => {}
+            match self.search_in_bucket(key, fingerprint, i) {
+                (Some(idx), _) => return Some(self.buckets[i].pairs[idx].1),
+                (None, Some(_)) => return None,
+                (None, None) => (),
             };
-            i = (i + 1) & self.size - 1
+            i = (i + 1) & self.buckets.len() - 1
         }
-
-        for i in candidates {
-            if key == self.keys[i] {
-                return Some(&self.values[i]);
-            }
-        }
-
-        None
     }
 
     #[inline(never)] // for flamegraph
     pub fn put(&mut self, key: u64, value: u64) -> Option<u64> {
+        if (self.num_keys + self.num_tombstones) as f64 / (self.buckets.len() * BUCKET_SIZE) as f64
+            > LOAD_FACTOR
+        {
+            self.resize();
+        }
+
         let (mut i, hash) = self.index(key);
-        let mut first_deleted: Option<usize> = None;
+        let fingerprint = (hash & 0x7F) as u8;
+        self.num_keys += 1;
 
         loop {
-            match self.ctrl[i] {
-                EMPTY => {
-                    // empty, put element here
-                    let i = first_deleted.unwrap_or(i);
-                    if first_deleted.is_some() {
-                        self.tombstones -= 1;
-                    }
+            let (check, found_empty) = self.search_in_bucket(key, fingerprint, i);
+            if let Some(old_index) = check {
+                let old_value = self.buckets[i].pairs[old_index].1;
+                self.buckets[i].fingerprints[old_index] = fingerprint;
+                self.buckets[i].pairs[old_index] = (key, value);
 
-                    self.ctrl[i] = (hash & 0x7F) as u8;
-                    self.keys[i] = key;
-                    self.values[i] = value;
-                    self.elements += 1;
-                    if self.elements + self.tombstones >= self.resize_threshold {
-                        self.resize();
-                    }
-                    return None;
-                }
-                TOMBSTONE => {
-                    // can place at first tombstone we encounter
-                    if first_deleted.is_none() {
-                        first_deleted = Some(i);
-                    }
-                }
-                _ if self.ctrl[i] & 0x80 == FULL && self.keys[i] == key => {
-                    // occupied with same key TODO: use same as get logic
-                    let old = self.values[i];
-                    self.values[i] = value;
-                    return Some(old);
-                }
-                _ => {}
+                return Some(old_value);
+            } else if found_empty.is_some() {
+                let idx = found_empty.unwrap() as usize;
+                self.buckets[i].fingerprints[idx] = fingerprint;
+                self.buckets[i].pairs[idx] = (key, value);
+
+                return None;
             }
-            i = (i + 1) & self.size - 1;
+
+            i = (i + 1) & self.buckets.len() - 1;
         }
     }
 
     #[inline(never)] // for flamegraph
     pub fn delete(&mut self, key: u64) -> Option<u64> {
-        let (mut i, _) = self.index(key);
+        let (mut i, hash) = self.index(key);
+        let fingerprint = (hash & 0x7F) as u8;
 
         loop {
-            match self.ctrl[i] {
-                EMPTY => return None,
-                _ if self.ctrl[i] & 0x80 == FULL && self.keys[i] == key => {
-                    // TODO: same as get logic
-                    self.ctrl[i] = 0xFF;
-                    self.tombstones += 1;
-                    self.elements -= 1;
-                    if self.tombstones > self.size / 3 {
-                        self.clear_tombstones();
-                    }
+            match self.search_in_bucket(key, fingerprint, i) {
+                (Some(idx), _) => {
+                    let old = self.buckets[i].pairs[idx].1;
+                    self.buckets[i].fingerprints[idx] = TOMBSTONE;
 
-                    return Some(self.values[i]);
+                    self.num_tombstones += 1;
+                    return Some(old);
                 }
-                _ => i = (i + 1) & self.size - 1,
+                (None, Some(_)) => return None,
+                (None, None) => (),
             }
+            i = (i + 1) & self.buckets.len() - 1;
         }
     }
 
     #[inline(never)] // for flamegraph
     fn resize(&mut self) {
-        let mut new_map = VectorHash::with_capacity(self.size * 4);
+        let mut new_map = VectorHash::with_capacity(self.buckets.len() * 4);
 
-        let old_keys = std::mem::take(&mut self.keys);
-        let old_values = std::mem::take(&mut self.values);
-        let old_ctrl = std::mem::take(&mut self.ctrl);
-
-        for i in 0..self.size {
-            if old_ctrl[i] & 0x80 == FULL {
-                let k = old_keys[i];
-                let v = old_values[i];
-                new_map.put(k, v);
+        for bucket in &self.buckets {
+            for (idx, fp) in bucket.fingerprints.iter().enumerate() {
+                if fp >> 7 == 0 {
+                    let (k, v) = (bucket.pairs[idx].0, bucket.pairs[idx].1);
+                    new_map.put(k, v);
+                }
             }
         }
 
@@ -159,22 +135,38 @@ impl VectorHash {
     }
 
     #[inline(never)] // for flamegraph
-    fn clear_tombstones(&mut self) {
-        let mut new_map = VectorHash::with_capacity(self.size);
 
-        let old_keys = std::mem::take(&mut self.keys);
-        let old_values = std::mem::take(&mut self.values);
-        let old_ctrl = std::mem::take(&mut self.ctrl);
+    // returns an option. if Some(), it will be the matching index
+    fn search_in_bucket(
+        &self,
+        key: u64,
+        fingerprint: u8,
+        bucket_index: usize,
+    ) -> (Option<usize>, Option<usize>) {
+        let bucket = &self.buckets[bucket_index];
 
-        for i in 0..self.size {
-            if old_ctrl[i] & 0x80 == FULL {
-                let k = old_keys[i];
-                let v = old_values[i];
-                new_map.put(k, v);
+        let mut found_empty = None;
+        let mut candidates = vec![];
+        for (idx, print) in bucket.fingerprints.iter().enumerate() {
+            if fingerprint == *print {
+                candidates.push(idx);
+            }
+            if *print == EMPTY {
+                found_empty = Some(idx);
             }
         }
 
-        *self = new_map;
+        if candidates.is_empty() {
+            return (None, found_empty);
+        }
+
+        for candidate in candidates {
+            if key == bucket.pairs[candidate].0 {
+                return (Some(candidate), found_empty);
+            }
+        }
+
+        (None, found_empty)
     }
 
     #[inline(never)] // for flamegraph
@@ -182,7 +174,7 @@ impl VectorHash {
         let mut hasher = AHasher::default();
         key.hash(&mut hasher);
         let hash = hasher.finish();
-        (hash as usize & (self.size - 1), hash)
+        (hash as usize & (self.buckets.len() - 1), hash)
     }
 }
 

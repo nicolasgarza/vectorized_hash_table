@@ -12,7 +12,7 @@ impl quickbench::wrapper::Container<u64, u64> for VectorHash {
         self.put(key, value);
     }
 
-    fn get(&self, key: &u64) -> Option<&u64> {
+    fn get(&self, key: &u64) -> Option<u64> {
         self.get(*key)
     }
 
