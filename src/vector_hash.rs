@@ -75,7 +75,6 @@ impl VectorHash {
 
         let (mut i, hash) = self.index(key);
         let fingerprint = (hash & 0x7F) as u8;
-        self.num_keys += 1;
 
         loop {
             let (check, found_empty) = self.search_in_bucket(key, fingerprint, i);
@@ -90,6 +89,7 @@ impl VectorHash {
                 self.buckets[i].fingerprints[idx] = fingerprint;
                 self.buckets[i].pairs[idx] = (key, value);
 
+                self.num_keys += 1;
                 return None;
             }
 
@@ -192,3 +192,132 @@ fn simd_match(fingerprint: u8, buckets: [u8; 16]) -> (bool, [bool; 16]) {
 }
 
 */
+
+#[cfg(test)]
+mod tests {
+    use super::VectorHash;
+
+    #[test]
+    fn get_missing_returns_none() {
+        let map = VectorHash::new();
+        assert_eq!(map.get(42), None);
+    }
+
+    #[test]
+    fn put_then_get_returns_value() {
+        let mut map = VectorHash::new();
+        assert_eq!(map.put(1, 100), None);
+        assert_eq!(map.get(1), Some(100));
+    }
+
+    #[test]
+    fn put_overwrite_returns_old_and_updates_value() {
+        let mut map = VectorHash::new();
+        assert_eq!(map.put(1, 100), None);
+        assert_eq!(map.put(1, 200), Some(100));
+        assert_eq!(map.get(1), Some(200));
+    }
+
+    #[test]
+    fn delete_existing_returns_value() {
+        let mut map = VectorHash::new();
+        map.put(7, 77);
+        assert_eq!(map.delete(7), Some(77));
+        assert_eq!(map.get(7), None);
+    }
+
+    #[test]
+    fn delete_missing_returns_none() {
+        let mut map = VectorHash::new();
+        assert_eq!(map.delete(99), None);
+    }
+
+    #[test]
+    fn delete_twice_returns_none_second_time() {
+        let mut map = VectorHash::new();
+        map.put(5, 50);
+        map.delete(5);
+        assert_eq!(map.delete(5), None);
+    }
+
+    #[test]
+    fn tombstone_does_not_break_probe_chain() {
+        let mut map = VectorHash::new();
+        for i in 0..60 {
+            map.put(i, i * 10);
+        }
+        map.delete(20);
+        for i in 0..60 {
+            if i == 20 {
+                assert_eq!(map.get(i), None);
+            } else {
+                assert_eq!(map.get(i), Some(i * 10));
+            }
+        }
+    }
+
+    #[test]
+    fn put_after_delete_reuses_slot() {
+        let mut map = VectorHash::new();
+        map.put(1, 10);
+        map.put(2, 20);
+        map.delete(1);
+        assert_eq!(map.put(1, 99), None);
+        assert_eq!(map.get(1), Some(99));
+        assert_eq!(map.get(2), Some(20));
+    }
+
+    #[test]
+    fn resize_preserves_all_entries() {
+        let mut map = VectorHash::new();
+        for i in 0..200 {
+            map.put(i, i * 3);
+        }
+        for i in 0..200 {
+            assert_eq!(map.get(i), Some(i * 3));
+        }
+    }
+
+    #[test]
+    fn with_capacity_basic_ops() {
+        let mut map = VectorHash::with_capacity(64);
+        map.put(1000, 9999);
+        assert_eq!(map.get(1000), Some(9999));
+    }
+
+    #[test]
+    fn zero_key_and_value() {
+        let mut map = VectorHash::new();
+        assert_eq!(map.put(0, 0), None);
+        assert_eq!(map.get(0), Some(0));
+        assert_eq!(map.delete(0), Some(0));
+        assert_eq!(map.get(0), None);
+    }
+
+    #[test]
+    fn u64_max_key() {
+        let mut map = VectorHash::new();
+        map.put(u64::MAX, 42);
+        assert_eq!(map.get(u64::MAX), Some(42));
+        assert_eq!(map.delete(u64::MAX), Some(42));
+        assert_eq!(map.get(u64::MAX), None);
+    }
+
+    #[test]
+    fn many_deletes_then_inserts() {
+        let mut map = VectorHash::new();
+        for i in 0..100 {
+            map.put(i, i);
+        }
+        for i in 0..50 {
+            map.delete(i);
+        }
+        for i in 0..50 {
+            map.put(i, i * 2);
+        }
+        for i in 0..100 {
+            let expected = if i < 50 { i * 2 } else { i };
+            assert_eq!(map.get(i), Some(expected));
+        }
+    }
+}
