@@ -1,6 +1,7 @@
 use ahash::AHasher;
 use std::cmp::max;
 use std::hash::{Hash, Hasher};
+use std::usize;
 // use std::simd;
 // use std::simd::cmp::SimdPartialEq;
 
@@ -11,13 +12,13 @@ pub struct VectorHash {
 }
 
 pub struct Bucket {
-    fingerprints: [u8; 16],
+    fingerprints: [u8; 32],
     pairs: [(u64, u64); 32],
 }
 
 impl Default for Bucket {
     fn default() -> Self {
-        let fingerprints = [EMPTY; 16];
+        let fingerprints = [EMPTY; 32];
         Self {
             fingerprints,
             pairs: Default::default(),
@@ -27,7 +28,7 @@ impl Default for Bucket {
 
 const EMPTY: u8 = 0x80;
 const TOMBSTONE: u8 = 0xFE;
-const BUCKET_SIZE: usize = 16;
+const BUCKET_SIZE: usize = 32;
 const LOAD_FACTOR: f64 = 0.7;
 
 impl VectorHash {
@@ -35,7 +36,7 @@ impl VectorHash {
         VectorHash {
             num_keys: 0,
             num_tombstones: 0,
-            buckets: (0..16).map(|_| Bucket::default()).collect(),
+            buckets: (0..32).map(|_| Bucket::default()).collect(),
         }
     }
 
@@ -57,9 +58,9 @@ impl VectorHash {
         loop {
             // never an infinite loop, as there are always empty slots in array
             match self.search_in_bucket(key, fingerprint, i) {
-                (Some(idx), _) => return Some(self.buckets[i].pairs[idx].1),
-                (None, Some(_)) => return None,
-                (None, None) => (),
+                (Some(idx), _, _) => return Some(self.buckets[i].pairs[idx].1),
+                (None, Some(_), _) => return None,
+                (None, None, _) => (),
             };
             i = (i + 1) & self.buckets.len() - 1
         }
@@ -75,19 +76,46 @@ impl VectorHash {
 
         let (mut i, hash) = self.index(key);
         let fingerprint = (hash & 0x7F) as u8;
+        let (mut tombstone_slot, mut tombstone_bucket) = (usize::MAX, usize::MAX);
 
         loop {
-            let (check, found_empty) = self.search_in_bucket(key, fingerprint, i);
-            if let Some(old_index) = check {
-                let old_value = self.buckets[i].pairs[old_index].1;
-                self.buckets[i].fingerprints[old_index] = fingerprint;
-                self.buckets[i].pairs[old_index] = (key, value);
+            let (check, found_empty, found_tombstone_slot) =
+                self.search_in_bucket(key, fingerprint, i);
+            if found_tombstone_slot.is_some() && tombstone_bucket == usize::MAX {
+                tombstone_bucket = i;
+                tombstone_slot = found_tombstone_slot.unwrap();
+            }
 
-                return Some(old_value);
-            } else if found_empty.is_some() {
-                let idx = found_empty.unwrap() as usize;
-                self.buckets[i].fingerprints[idx] = fingerprint;
-                self.buckets[i].pairs[idx] = (key, value);
+            if let Some(old_index) = check {
+                if old_index > tombstone_slot || tombstone_bucket < i {
+                    let old_value = self.buckets[i].pairs[old_index].1;
+                    self.buckets[tombstone_bucket].fingerprints[tombstone_slot] = fingerprint;
+                    self.buckets[tombstone_bucket].pairs[tombstone_slot] = (key, value);
+
+                    self.buckets[i].fingerprints[old_index] = TOMBSTONE;
+
+                    return Some(old_value);
+                } else {
+                    let old_value = self.buckets[i].pairs[old_index].1;
+                    self.buckets[i].fingerprints[old_index] = fingerprint;
+                    self.buckets[i].pairs[old_index] = (key, value);
+
+                    return Some(old_value);
+                }
+            } else if let Some(empty_slot) = found_empty {
+                if tombstone_bucket < i {
+                    self.buckets[tombstone_bucket].fingerprints[tombstone_slot] = fingerprint;
+                    self.buckets[tombstone_bucket].pairs[tombstone_slot] = (key, value);
+                } else {
+                    let mut idx = empty_slot;
+                    if tombstone_slot < empty_slot {
+                        idx = tombstone_slot;
+                        self.num_tombstones -= 1;
+                    }
+
+                    self.buckets[i].fingerprints[idx] = fingerprint;
+                    self.buckets[i].pairs[idx] = (key, value);
+                }
 
                 self.num_keys += 1;
                 return None;
@@ -104,15 +132,15 @@ impl VectorHash {
 
         loop {
             match self.search_in_bucket(key, fingerprint, i) {
-                (Some(idx), _) => {
+                (Some(idx), _, _) => {
                     let old = self.buckets[i].pairs[idx].1;
                     self.buckets[i].fingerprints[idx] = TOMBSTONE;
 
                     self.num_tombstones += 1;
                     return Some(old);
                 }
-                (None, Some(_)) => return None,
-                (None, None) => (),
+                (None, Some(_), _) => return None,
+                (None, None, _) => (),
             }
             i = (i + 1) & self.buckets.len() - 1;
         }
@@ -142,10 +170,11 @@ impl VectorHash {
         key: u64,
         fingerprint: u8,
         bucket_index: usize,
-    ) -> (Option<usize>, Option<usize>) {
+    ) -> (Option<usize>, Option<usize>, Option<usize>) {
         let bucket = &self.buckets[bucket_index];
 
         let mut found_empty = None;
+        let mut found_tombstone = None;
         let mut candidates = vec![];
         for (idx, print) in bucket.fingerprints.iter().enumerate() {
             if fingerprint == *print {
@@ -153,20 +182,22 @@ impl VectorHash {
             }
             if *print == EMPTY {
                 found_empty = Some(idx);
+            } else if *print == TOMBSTONE && found_tombstone.is_none() {
+                found_tombstone = Some(idx);
             }
         }
 
         if candidates.is_empty() {
-            return (None, found_empty);
+            return (None, found_empty, found_tombstone);
         }
 
         for candidate in candidates {
             if key == bucket.pairs[candidate].0 {
-                return (Some(candidate), found_empty);
+                return (Some(candidate), found_empty, found_tombstone);
             }
         }
 
-        (None, found_empty)
+        (None, found_empty, found_tombstone)
     }
 
     #[inline(never)] // for flamegraph
@@ -318,6 +349,120 @@ mod tests {
         for i in 0..100 {
             let expected = if i < 50 { i * 2 } else { i };
             assert_eq!(map.get(i), Some(expected));
+        }
+    }
+
+    #[test]
+    fn stress_sequential_keys() {
+        let mut map = VectorHash::new();
+        let n = 10_000u64;
+        for i in 0..n {
+            assert_eq!(map.put(i, i * 7), None);
+        }
+        for i in 0..n {
+            assert_eq!(map.get(i), Some(i * 7));
+        }
+        for i in 0..n {
+            assert_eq!(map.delete(i), Some(i * 7));
+            assert_eq!(map.get(i), None);
+        }
+    }
+
+    #[test]
+    fn stress_overwrite_same_key() {
+        let mut map = VectorHash::new();
+        let mut prev = None;
+        for i in 0..10_000u64 {
+            let ret = map.put(42, i);
+            assert_eq!(ret, prev);
+            prev = Some(i);
+        }
+        assert_eq!(map.get(42), Some(9_999));
+    }
+
+    #[test]
+    fn stress_interleaved_put_delete() {
+        let mut map = VectorHash::new();
+        let n = 5_000u64;
+
+        for i in 0..n {
+            map.put(i, i);
+        }
+
+        for i in 0..n {
+            if i % 2 == 0 {
+                assert_eq!(map.delete(i), Some(i));
+            } else {
+                assert_eq!(map.put(i, i * 3), Some(i));
+            }
+            map.put(n + i, i * 5);
+        }
+
+        for i in 0..n {
+            if i % 2 == 0 {
+                assert_eq!(map.get(i), None);
+            } else {
+                assert_eq!(map.get(i), Some(i * 3));
+            }
+            assert_eq!(map.get(n + i), Some(i * 5));
+        }
+    }
+
+    #[test]
+    fn stress_sparse_large_keys() {
+        let mut map = VectorHash::new();
+        let keys: Vec<u64> = (0..5_000).map(|i| i * 1_000_003).collect();
+
+        for &k in &keys {
+            map.put(k, k ^ 0xDEADBEEF);
+        }
+
+        for &k in &keys {
+            assert_eq!(map.get(k), Some(k ^ 0xDEADBEEF));
+        }
+
+        for &k in keys.iter().step_by(2) {
+            map.delete(k);
+        }
+
+        for (i, &k) in keys.iter().enumerate() {
+            if i % 2 == 0 {
+                assert_eq!(map.get(k), None);
+            } else {
+                assert_eq!(map.get(k), Some(k ^ 0xDEADBEEF));
+            }
+        }
+    }
+
+    #[test]
+    fn stress_multiple_resizes() {
+        let mut map = VectorHash::with_capacity(16);
+        let n = 50_000u64;
+        for i in 0..n {
+            map.put(i, i);
+        }
+
+        for i in 0..n {
+            assert_eq!(map.get(i), Some(i), "missing key {i} after resizes");
+        }
+    }
+
+    #[test]
+    fn stress_delete_all_then_reinsert() {
+        let mut map = VectorHash::new();
+        let n = 5_000u64;
+        for i in 0..n {
+            map.put(i, i);
+        }
+        for i in 0..n {
+            assert_eq!(map.delete(i), Some(i));
+        }
+
+        for i in 0..n {
+            assert_eq!(map.put(i, i * 2), None);
+        }
+        for i in 0..n {
+            assert_eq!(map.get(i), Some(i * 2));
         }
     }
 }
