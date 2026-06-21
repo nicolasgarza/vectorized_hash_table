@@ -53,7 +53,7 @@ impl VectorHash {
     #[inline(never)] // for flamegraph
     pub fn get(&self, key: u64) -> Option<u64> {
         let (mut i, hash) = self.index(key);
-        let fingerprint = (hash & 0x7F) as u8;
+        let fingerprint = (hash >> 57) as u8;
 
         loop {
             // never an infinite loop, as there are always empty slots in array
@@ -75,7 +75,7 @@ impl VectorHash {
         }
 
         let (mut i, hash) = self.index(key);
-        let fingerprint = (hash & 0x7F) as u8;
+        let fingerprint = (hash >> 57) as u8;
         let (mut tombstone_slot, mut tombstone_bucket) = (usize::MAX, usize::MAX);
 
         loop {
@@ -87,25 +87,16 @@ impl VectorHash {
             }
 
             if let Some(old_index) = check {
-                if old_index > tombstone_slot || tombstone_bucket < i {
-                    let old_value = self.buckets[i].pairs[old_index].1;
-                    self.buckets[tombstone_bucket].fingerprints[tombstone_slot] = fingerprint;
-                    self.buckets[tombstone_bucket].pairs[tombstone_slot] = (key, value);
+                let old_value = self.buckets[i].pairs[old_index].1;
+                self.buckets[i].fingerprints[old_index] = fingerprint;
+                self.buckets[i].pairs[old_index] = (key, value);
 
-                    self.buckets[i].fingerprints[old_index] = TOMBSTONE;
-
-                    return Some(old_value);
-                } else {
-                    let old_value = self.buckets[i].pairs[old_index].1;
-                    self.buckets[i].fingerprints[old_index] = fingerprint;
-                    self.buckets[i].pairs[old_index] = (key, value);
-
-                    return Some(old_value);
-                }
+                return Some(old_value);
             } else if let Some(empty_slot) = found_empty {
                 if tombstone_bucket < i {
                     self.buckets[tombstone_bucket].fingerprints[tombstone_slot] = fingerprint;
                     self.buckets[tombstone_bucket].pairs[tombstone_slot] = (key, value);
+                    self.num_tombstones -= 1;
                 } else {
                     let mut idx = empty_slot;
                     if tombstone_slot < empty_slot {
@@ -128,7 +119,7 @@ impl VectorHash {
     #[inline(never)] // for flamegraph
     pub fn delete(&mut self, key: u64) -> Option<u64> {
         let (mut i, hash) = self.index(key);
-        let fingerprint = (hash & 0x7F) as u8;
+        let fingerprint = (hash >> 57) as u8;
 
         loop {
             match self.search_in_bucket(key, fingerprint, i) {
@@ -175,25 +166,14 @@ impl VectorHash {
 
         let mut found_empty = None;
         let mut found_tombstone = None;
-        let mut candidates = vec![];
         for (idx, print) in bucket.fingerprints.iter().enumerate() {
-            if fingerprint == *print {
-                candidates.push(idx);
+            if fingerprint == *print && bucket.pairs[idx].0 == key {
+                return (Some(idx), found_empty, found_tombstone);
             }
             if *print == EMPTY {
                 found_empty = Some(idx);
             } else if *print == TOMBSTONE && found_tombstone.is_none() {
                 found_tombstone = Some(idx);
-            }
-        }
-
-        if candidates.is_empty() {
-            return (None, found_empty, found_tombstone);
-        }
-
-        for candidate in candidates {
-            if key == bucket.pairs[candidate].0 {
-                return (Some(candidate), found_empty, found_tombstone);
             }
         }
 
