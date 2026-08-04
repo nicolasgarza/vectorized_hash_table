@@ -1,9 +1,8 @@
+use std::simd::{cmp::SimdPartialEq, u8x32};
 use ahash::AHasher;
 use std::cmp::max;
 use std::hash::{Hash, Hasher};
 use std::usize;
-// use std::simd;
-// use std::simd::cmp::SimdPartialEq;
 
 pub struct VectorHash {
     num_keys: usize,
@@ -41,7 +40,7 @@ impl VectorHash {
     }
 
     pub fn with_capacity(size: usize) -> Self {
-        let size = max(size, 16);
+        let size = max(size, 16).next_power_of_two();
 
         VectorHash {
             num_keys: 0,
@@ -50,7 +49,6 @@ impl VectorHash {
         }
     }
 
-    #[inline(never)] // for flamegraph
     pub fn get(&self, key: u64) -> Option<u64> {
         let (mut i, hash) = self.index(key);
         let fingerprint = (hash >> 57) as u8;
@@ -66,7 +64,6 @@ impl VectorHash {
         }
     }
 
-    #[inline(never)] // for flamegraph
     pub fn put(&mut self, key: u64, value: u64) -> Option<u64> {
         if (self.num_keys + self.num_tombstones) as f64 / (self.buckets.len() * BUCKET_SIZE) as f64
             > LOAD_FACTOR
@@ -93,20 +90,15 @@ impl VectorHash {
 
                 return Some(old_value);
             } else if let Some(empty_slot) = found_empty {
-                if tombstone_bucket < i {
-                    self.buckets[tombstone_bucket].fingerprints[tombstone_slot] = fingerprint;
-                    self.buckets[tombstone_bucket].pairs[tombstone_slot] = (key, value);
+                let (insert_bucket, insert_slot) = if tombstone_bucket != usize::MAX {
                     self.num_tombstones -= 1;
+                    (tombstone_bucket, tombstone_slot)
                 } else {
-                    let mut idx = empty_slot;
-                    if tombstone_slot < empty_slot {
-                        idx = tombstone_slot;
-                        self.num_tombstones -= 1;
-                    }
+                    (i, empty_slot)
+                };
 
-                    self.buckets[i].fingerprints[idx] = fingerprint;
-                    self.buckets[i].pairs[idx] = (key, value);
-                }
+                self.buckets[insert_bucket].fingerprints[insert_slot] = fingerprint;
+                self.buckets[insert_bucket].pairs[insert_slot] = (key, value);
 
                 self.num_keys += 1;
                 return None;
@@ -116,7 +108,6 @@ impl VectorHash {
         }
     }
 
-    #[inline(never)] // for flamegraph
     pub fn delete(&mut self, key: u64) -> Option<u64> {
         let (mut i, hash) = self.index(key);
         let fingerprint = (hash >> 57) as u8;
@@ -127,6 +118,7 @@ impl VectorHash {
                     let old = self.buckets[i].pairs[idx].1;
                     self.buckets[i].fingerprints[idx] = TOMBSTONE;
 
+                    self.num_keys -= 1;
                     self.num_tombstones += 1;
                     return Some(old);
                 }
@@ -137,7 +129,6 @@ impl VectorHash {
         }
     }
 
-    #[inline(never)] // for flamegraph
     fn resize(&mut self) {
         let mut new_map = VectorHash::with_capacity(self.buckets.len() * 4);
 
@@ -153,8 +144,6 @@ impl VectorHash {
         *self = new_map;
     }
 
-    #[inline(never)] // for flamegraph
-
     // returns an option. if Some(), it will be the matching index
     fn search_in_bucket(
         &self,
@@ -164,23 +153,33 @@ impl VectorHash {
     ) -> (Option<usize>, Option<usize>, Option<usize>) {
         let bucket = &self.buckets[bucket_index];
 
-        let mut found_empty = None;
-        let mut found_tombstone = None;
-        for (idx, print) in bucket.fingerprints.iter().enumerate() {
-            if fingerprint == *print && bucket.pairs[idx].0 == key {
+        let (mut matches, empties, tombstones) = simd_fingerprint_masks(&bucket.fingerprints, fingerprint);
+
+        let found_empty = if empties == 0 {
+            None
+        } else {
+            Some(empties.trailing_zeros() as usize)
+        };
+
+        let found_tombstone = if tombstones == 0 {
+            None
+        } else {
+            Some(tombstones.trailing_zeros() as usize)
+        };
+
+        while matches != 0 {
+            let idx = matches.trailing_zeros() as usize;
+
+            if bucket.pairs[idx].0 == key {
                 return (Some(idx), found_empty, found_tombstone);
             }
-            if *print == EMPTY {
-                found_empty = Some(idx);
-            } else if *print == TOMBSTONE && found_tombstone.is_none() {
-                found_tombstone = Some(idx);
-            }
+
+            matches &= matches - 1;
         }
 
         (None, found_empty, found_tombstone)
     }
 
-    #[inline(never)] // for flamegraph
     fn index(&self, key: u64) -> (usize, u64) {
         let mut hasher = AHasher::default();
         key.hash(&mut hasher);
@@ -189,20 +188,27 @@ impl VectorHash {
     }
 }
 
-/*
-// returns if any element is in the array, and the mask
-fn simd_match(fingerprint: u8, buckets: [u8; 16]) -> (bool, [bool; 16]) {
-    let cmp_vec: simd::Simd<u8, 16> = simd::Simd::splat(fingerprint);
-    let data = simd::Simd::<u8, 16>::from_array(buckets);
 
-    let mask = data.simd_eq(cmp_vec);
+fn simd_fingerprint_masks(
+    fingerprints: &[u8; BUCKET_SIZE],
+    fingerprint: u8,
+) -> (u32, u32, u32) {
+    let data = u8x32::from_array(*fingerprints);
 
-    let tomb_vec: simd::Simd<u8, 16> = simd::Simd::splat(EMPTY);
-    let tomb_mask = data.simd_eq(tomb_vec);
-    (tomb_mask.any(), mask.to_array())
+    let matches = data
+        .simd_eq(u8x32::splat(fingerprint))
+        .to_bitmask() as u32;
+
+    let empties = data
+        .simd_eq(u8x32::splat(EMPTY))
+        .to_bitmask() as u32;
+
+    let tombstones = data
+        .simd_eq(u8x32::splat(TOMBSTONE))
+        .to_bitmask() as u32;
+
+    (matches, empties, tombstones)
 }
-
-*/
 
 #[cfg(test)]
 mod tests {
